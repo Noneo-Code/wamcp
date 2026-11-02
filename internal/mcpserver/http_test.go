@@ -5,6 +5,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 )
 
@@ -37,7 +38,8 @@ func TestLoadOrCreateToken(t *testing.T) {
 		t.Fatalf("token %q, err %v", first, err)
 	}
 	info, _ := os.Stat(path)
-	if info.Mode().Perm() != 0o600 {
+	// Windows has no Unix permission bits: os.Stat always reports 0666.
+	if runtime.GOOS != "windows" && info.Mode().Perm() != 0o600 {
 		t.Errorf("token file mode %v", info.Mode().Perm())
 	}
 	second, _ := LoadOrCreateToken(path)

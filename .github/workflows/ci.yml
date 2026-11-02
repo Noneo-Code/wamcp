@@ -23,6 +23,7 @@ jobs:
           go-version-file: go.mod
       - run: go vet ./...
       - run: go test -race -coverprofile=coverage.out ./...
+        shell: bash # PowerShell splits -coverprofile=coverage.out at the dot
       - run: go build -trimpath -o wamcp ./cmd/wamcp
 
   lint:
