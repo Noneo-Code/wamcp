@@ -152,7 +152,10 @@ func (s *Store) SaveMessage(ctx context.Context, m Message) error {
 			mimetype = excluded.mimetype,
 			raw = CASE WHEN messages.deleted = 1 THEN NULL ELSE COALESCE(excluded.raw, messages.raw) END,
 			edited = MAX(messages.edited, excluded.edited),
-			deleted = MAX(messages.deleted, excluded.deleted)`,
+			deleted = MAX(messages.deleted, excluded.deleted)
+		-- Message IDs are chosen by the sending client: only the original sender
+		-- may refresh a message, so nobody can overwrite someone else's by reusing its ID.
+		WHERE messages.sender_jid = excluded.sender_jid AND messages.from_me = excluded.from_me`,
 		m.ChatJID, m.ID, m.SenderJID, m.FromMe, unix(m.Timestamp), m.Text,
 		m.MediaType, m.Filename, m.MimeType, nilIfEmpty(m.Raw), m.Edited, m.Deleted); err != nil {
 		return fmt.Errorf("save message %s: %w", m.ID, err)
@@ -160,10 +163,12 @@ func (s *Store) SaveMessage(ctx context.Context, m Message) error {
 	return tx.Commit()
 }
 
-// EditMessage replaces the text of a stored message. Unknown messages are ignored.
-func (s *Store) EditMessage(ctx context.Context, chatJID, id, text string) error {
+// EditMessage replaces the text of a stored message, only if editorJID is its
+// sender (WhatsApp only lets authors edit). Unknown messages are ignored.
+func (s *Store) EditMessage(ctx context.Context, chatJID, id, editorJID, text string) error {
 	_, err := s.db.ExecContext(ctx,
-		`UPDATE messages SET text = ?, edited = 1 WHERE chat_jid = ? AND id = ?`, text, chatJID, id)
+		`UPDATE messages SET text = ?, edited = 1 WHERE chat_jid = ? AND id = ? AND sender_jid = ?`,
+		text, chatJID, id, editorJID)
 	if err != nil {
 		return fmt.Errorf("edit message %s: %w", id, err)
 	}
@@ -171,13 +176,34 @@ func (s *Store) EditMessage(ctx context.Context, chatJID, id, text string) error
 }
 
 // DeleteMessage marks a message as deleted for everyone and drops its content.
-func (s *Store) DeleteMessage(ctx context.Context, chatJID, id string) error {
-	_, err := s.db.ExecContext(ctx,
-		`UPDATE messages SET text = '', raw = NULL, deleted = 1 WHERE chat_jid = ? AND id = ?`, chatJID, id)
-	if err != nil {
-		return fmt.Errorf("delete message %s: %w", id, err)
+// Unless anySender is set (a verified group admin), only the message's own
+// sender can delete it. It reports whether a message was deleted.
+func (s *Store) DeleteMessage(ctx context.Context, chatJID, id, revokerJID string, anySender bool) (bool, error) {
+	q := `UPDATE messages SET text = '', raw = NULL, deleted = 1 WHERE chat_jid = ? AND id = ?`
+	args := []any{chatJID, id}
+	if !anySender {
+		q += ` AND sender_jid = ?`
+		args = append(args, revokerJID)
 	}
-	return nil
+	res, err := s.db.ExecContext(ctx, q, args...)
+	if err != nil {
+		return false, fmt.Errorf("delete message %s: %w", id, err)
+	}
+	n, err := res.RowsAffected()
+	return n > 0, err
+}
+
+// MessageSender returns the sender of a stored message.
+func (s *Store) MessageSender(ctx context.Context, chatJID, id string) (string, error) {
+	var sender string
+	err := s.db.QueryRowContext(ctx, `SELECT sender_jid FROM messages WHERE chat_jid = ? AND id = ?`, chatJID, id).Scan(&sender)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", ErrNotFound
+	}
+	if err != nil {
+		return "", fmt.Errorf("message sender %s: %w", id, err)
+	}
+	return sender, nil
 }
 
 // ListChatsParams filters ListChats.

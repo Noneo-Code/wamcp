@@ -277,14 +277,19 @@ func (c *Client) saveMessage(ctx context.Context, e *events.Message) bool {
 		chat = c.normalize(ctx, chat, alt)
 	}
 
+	sender := c.normalize(ctx, e.Info.Sender, e.Info.SenderAlt)
+	if e.Info.IsFromMe {
+		sender = c.OwnJID()
+	}
+
 	if pm := e.Message.GetProtocolMessage(); pm != nil {
 		target := pm.GetKey().GetID()
 		switch pm.GetType() {
 		case waE2E.ProtocolMessage_REVOKE:
-			c.logErr(c.store.DeleteMessage(ctx, chat.String(), target))
+			c.revoke(ctx, chat, target, sender, e.Info.IsGroup)
 		case waE2E.ProtocolMessage_MESSAGE_EDIT:
 			if ct, ok := extractContent(pm.GetEditedMessage()); ok {
-				c.logErr(c.store.EditMessage(ctx, chat.String(), target, ct.Text))
+				c.logErr(c.store.EditMessage(ctx, chat.String(), target, sender.String(), ct.Text))
 			}
 		}
 		return false
@@ -297,12 +302,8 @@ func (c *Client) saveMessage(ctx context.Context, e *events.Message) bool {
 	if e.IsEdit {
 		// History sync delivers edits already merged into the original ID but
 		// with the edit's timestamp: only update the text, keep the position.
-		c.logErr(c.store.EditMessage(ctx, chat.String(), e.Info.ID, ct.Text))
+		c.logErr(c.store.EditMessage(ctx, chat.String(), e.Info.ID, sender.String(), ct.Text))
 		return false
-	}
-	sender := c.normalize(ctx, e.Info.Sender, e.Info.SenderAlt)
-	if e.Info.IsFromMe {
-		sender = c.OwnJID()
 	}
 	err := c.store.SaveMessage(ctx, store.Message{
 		ChatJID:   chat.String(),
@@ -360,6 +361,37 @@ func (c *Client) saveHistory(ctx context.Context, e *events.HistorySync) {
 	c.syncBatches++
 	c.syncMu.Unlock()
 	c.log.Infof("history sync (%s): %d messages", e.Data.GetSyncType(), stored)
+}
+
+// revoke applies a "delete for everyone": allowed for the message's sender, and
+// in groups for admins (checked against WhatsApp, since anyone can send a revoke).
+func (c *Client) revoke(ctx context.Context, chat types.JID, target string, revoker types.JID, isGroup bool) {
+	deleted, err := c.store.DeleteMessage(ctx, chat.String(), target, revoker.String(), false)
+	if err != nil || deleted || !isGroup {
+		c.logErr(err)
+		return
+	}
+	if _, err := c.store.MessageSender(ctx, chat.String(), target); err != nil {
+		return // unknown message, nothing to delete
+	}
+	info, err := c.wm.GetGroupInfo(ctx, chat)
+	if err != nil {
+		c.log.Warnf("ignoring revoke of %s: cannot check admins of %s: %v", target, chat, err)
+		return
+	}
+	for _, p := range info.Participants {
+		if !p.IsAdmin && !p.IsSuperAdmin {
+			continue
+		}
+		for _, j := range []types.JID{p.JID, p.PhoneNumber, p.LID} {
+			if !j.IsEmpty() && c.normalize(ctx, j, types.EmptyJID) == revoker {
+				_, err := c.store.DeleteMessage(ctx, chat.String(), target, revoker.String(), true)
+				c.logErr(err)
+				return
+			}
+		}
+	}
+	c.log.Warnf("ignoring revoke of %s in %s by non-admin %s", target, chat, revoker)
 }
 
 // learnLIDMapping records the LID<->phone-number pair a history conversation carries.

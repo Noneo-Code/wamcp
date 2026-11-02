@@ -115,7 +115,7 @@ func TestEditAndDeleteSurviveResync(t *testing.T) {
 	s := openTest(t)
 	orig := Message{ChatJID: "c@s.whatsapp.net", ID: "x", Timestamp: at(1), Text: "typo", Raw: []byte{1}}
 	mustSave(t, s, orig)
-	if err := s.EditMessage(ctx, orig.ChatJID, "x", "fixed"); err != nil {
+	if err := s.EditMessage(ctx, orig.ChatJID, "x", orig.SenderJID, "fixed"); err != nil {
 		t.Fatal(err)
 	}
 	mustSave(t, s, orig) // history sync delivers the original again
@@ -127,7 +127,7 @@ func TestEditAndDeleteSurviveResync(t *testing.T) {
 		t.Errorf("after edit+resync: %+v", m)
 	}
 
-	if err := s.DeleteMessage(ctx, orig.ChatJID, "x"); err != nil {
+	if _, err := s.DeleteMessage(ctx, orig.ChatJID, "x", orig.SenderJID, false); err != nil {
 		t.Fatal(err)
 	}
 	mustSave(t, s, orig)
@@ -217,5 +217,35 @@ func TestRenameChatDoesNotCreateChats(t *testing.T) {
 	_ = s.RenameChat(ctx, "friend@s.whatsapp.net", "Friend")
 	if c, _ := s.GetChat(ctx, "friend@s.whatsapp.net"); c.Name != "Friend" {
 		t.Errorf("name = %q", c.Name)
+	}
+}
+
+func TestOnlySenderCanOverwriteEditOrDelete(t *testing.T) {
+	ctx := context.Background()
+	s := openTest(t)
+	const chat = "g@g.us"
+	orig := Message{ChatJID: chat, ID: "id1", SenderJID: "alice@s.whatsapp.net", Timestamp: at(1), Text: "rendez-vous à 18h"}
+	mustSave(t, s, orig)
+
+	// Mallory reuses Alice's message ID.
+	mustSave(t, s, Message{ChatJID: chat, ID: "id1", SenderJID: "mallory@s.whatsapp.net", Timestamp: at(2), Text: "rendez-vous annulé"})
+	if m, _ := s.GetMessage(ctx, chat, "id1"); m.Text != orig.Text || m.SenderJID != orig.SenderJID {
+		t.Fatalf("message overwritten by another sender: %+v", m)
+	}
+	// Mallory edits and deletes it.
+	_ = s.EditMessage(ctx, chat, "id1", "mallory@s.whatsapp.net", "hacked")
+	if deleted, _ := s.DeleteMessage(ctx, chat, "id1", "mallory@s.whatsapp.net", false); deleted {
+		t.Fatal("non-sender deleted the message")
+	}
+	if m, _ := s.GetMessage(ctx, chat, "id1"); m.Text != orig.Text || m.Deleted {
+		t.Fatalf("message altered by another sender: %+v", m)
+	}
+	// Alice can; a verified admin can delete.
+	_ = s.EditMessage(ctx, chat, "id1", "alice@s.whatsapp.net", "rendez-vous à 19h")
+	if m, _ := s.GetMessage(ctx, chat, "id1"); m.Text != "rendez-vous à 19h" {
+		t.Fatalf("sender edit not applied: %+v", m)
+	}
+	if deleted, _ := s.DeleteMessage(ctx, chat, "id1", "admin@s.whatsapp.net", true); !deleted {
+		t.Fatal("admin delete not applied")
 	}
 }

@@ -433,13 +433,24 @@ func (p FilePolicy) check(path string) (string, error) {
 	return resolved, nil
 }
 
-// within reports whether path is dir or inside it (both resolved).
+// within reports whether path is dir or inside it. It compares file identity
+// (device and inode) rather than strings, so case-insensitive file systems
+// (macOS, Windows), symlinks and alternate spellings cannot bypass it.
 func within(path, dir string) bool {
-	if d, err := filepath.EvalSymlinks(dir); err == nil {
-		dir = d
+	target, err := os.Stat(dir)
+	if err != nil {
+		return false
 	}
-	rel, err := filepath.Rel(dir, path)
-	return err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
+	for p := filepath.Clean(path); ; {
+		if fi, err := os.Stat(p); err == nil && os.SameFile(fi, target) {
+			return true
+		}
+		parent := filepath.Dir(p)
+		if parent == p {
+			return false
+		}
+		p = parent
+	}
 }
 
 // Status summarises the connection and archive.

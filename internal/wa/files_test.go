@@ -33,6 +33,14 @@ func TestFilePolicy(t *testing.T) {
 	_ = os.MkdirAll(sibling, 0o700)
 	siblingFile := write(filepath.Join(sibling, "a.txt"))
 
+	// On case-insensitive file systems (macOS, Windows) another spelling of the
+	// data directory designates the same files.
+	upperSession := filepath.Join(base, "DATA", "session.db")
+	caseInsensitive := false
+	if _, err := os.Stat(upperSession); err == nil {
+		caseInsensitive = true
+	}
+
 	open := FilePolicy{Protected: dataDir}
 	rooted := FilePolicy{Protected: dataDir, Root: shared}
 	tests := []struct {
@@ -50,6 +58,14 @@ func TestFilePolicy(t *testing.T) {
 		{"inside send root", rooted, doc, ""},
 		{"outside send root", rooted, outside, "only files under"},
 		{"missing file", open, filepath.Join(base, "nope"), "file:"},
+	}
+	if caseInsensitive {
+		tests = append(tests, struct {
+			name    string
+			policy  FilePolicy
+			path    string
+			wantErr string
+		}{"other case spelling", open, upperSession, "data directory"})
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
