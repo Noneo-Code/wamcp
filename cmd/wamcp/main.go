@@ -12,6 +12,8 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime/debug"
+	"strings"
 	"syscall"
 	"time"
 
@@ -25,8 +27,18 @@ import (
 	"github.com/Noneo-Code/wamcp/internal/wa"
 )
 
-// version is set at build time with -ldflags "-X main.version=…".
+// version is set at build time with -ldflags "-X main.version=…" (release
+// binaries); for `go install …@vX.Y.Z` it falls back to the module version.
 var version = "dev"
+
+func init() {
+	if version != "dev" {
+		return
+	}
+	if info, ok := debug.ReadBuildInfo(); ok && info.Main.Version != "" && info.Main.Version != "(devel)" {
+		version = strings.TrimPrefix(info.Main.Version, "v")
+	}
+}
 
 const usage = `wamcp - WhatsApp MCP server (unofficial, linked-device client)
 
