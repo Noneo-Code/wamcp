@@ -15,7 +15,9 @@ import (
 
 	"go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/proto/waE2E"
+	"go.mau.fi/whatsmeow/proto/waMmsRetry"
 	"go.mau.fi/whatsmeow/types"
+	"go.mau.fi/whatsmeow/types/events"
 	"google.golang.org/protobuf/proto"
 
 	"github.com/Noneo-Code/wamcp/internal/store"
@@ -226,30 +228,43 @@ type Sent struct {
 	Timestamp time.Time
 }
 
-// SendText sends a text message, optionally as a reply to a stored message.
-func (c *Client) SendText(ctx context.Context, to types.JID, text, replyToID string) (Sent, error) {
+// SendText sends a text message, optionally as a reply to a stored message
+// and mentioning users (the text must then contain "@<their number>").
+func (c *Client) SendText(ctx context.Context, to types.JID, text, replyToID string, mentions []types.JID) (Sent, error) {
 	if strings.TrimSpace(text) == "" {
 		return Sent{}, errors.New("message text is empty")
 	}
 	if err := c.checkRecipient(ctx, to); err != nil {
 		return Sent{}, err
 	}
-	msg := &waE2E.Message{Conversation: proto.String(text)}
+	var ci *waE2E.ContextInfo
 	if replyToID != "" {
 		quoted, err := c.store.GetMessage(ctx, to.String(), replyToID)
 		if err != nil {
 			return Sent{}, fmt.Errorf("message %s to reply to: %w", replyToID, err)
 		}
-		msg = &waE2E.Message{ExtendedTextMessage: &waE2E.ExtendedTextMessage{
-			Text: proto.String(text),
-			ContextInfo: &waE2E.ContextInfo{
-				StanzaID:      proto.String(quoted.ID),
-				Participant:   proto.String(quoted.SenderJID),
-				QuotedMessage: &waE2E.Message{Conversation: proto.String(quoted.Text)},
-			},
-		}}
+		ci = &waE2E.ContextInfo{
+			StanzaID:      proto.String(quoted.ID),
+			Participant:   proto.String(quoted.SenderJID),
+			QuotedMessage: &waE2E.Message{Conversation: proto.String(quoted.Text)},
+		}
 	}
-	return c.send(ctx, to, msg, content{Text: text})
+	if len(mentions) > 0 {
+		var jids []string
+		var err error
+		if text, jids, err = c.mentionText(ctx, to, text, mentions); err != nil {
+			return Sent{}, err
+		}
+		if ci == nil {
+			ci = &waE2E.ContextInfo{}
+		}
+		ci.MentionedJID = jids
+	}
+	msg := &waE2E.Message{Conversation: proto.String(text)}
+	if ci != nil {
+		msg = &waE2E.Message{ExtendedTextMessage: &waE2E.ExtendedTextMessage{Text: proto.String(text), ContextInfo: ci}}
+	}
+	return c.send(ctx, to, msg, content{Text: text, QuotedID: replyToID})
 }
 
 // SendFile uploads a local file and sends it as an image, video, audio or
@@ -281,6 +296,9 @@ func (c *Client) SendFile(ctx context.Context, to types.JID, path, caption strin
 		mimeType = http.DetectContentType(data)
 	}
 	mimeType, _, _ = strings.Cut(mimeType, ";")
+	if _, ok := opusDuration(data); ok {
+		mimeType = "audio/ogg" // content sniffing would call it application/ogg
+	}
 	name := filepath.Base(path)
 
 	kind, mediaType := "document", whatsmeow.MediaDocument
@@ -312,6 +330,12 @@ func (c *Client) SendFile(ctx context.Context, to types.JID, path, caption strin
 		msg.AudioMessage = &waE2E.AudioMessage{Mimetype: &mimeType,
 			URL: &up.URL, DirectPath: &up.DirectPath, MediaKey: up.MediaKey,
 			FileEncSHA256: up.FileEncSHA256, FileSHA256: up.FileSHA256, FileLength: size}
+		// An Ogg/Opus file is what WhatsApp records: send it as a voice message.
+		if seconds, ok := opusDuration(data); ok {
+			msg.AudioMessage.PTT = proto.Bool(true)
+			msg.AudioMessage.Mimetype = proto.String("audio/ogg; codecs=opus")
+			msg.AudioMessage.Seconds = proto.Uint32(seconds)
+		}
 	default:
 		msg.DocumentMessage = &waE2E.DocumentMessage{Caption: optional(caption), Mimetype: &mimeType,
 			FileName: &name, Title: &name,
@@ -322,7 +346,7 @@ func (c *Client) SendFile(ctx context.Context, to types.JID, path, caption strin
 	sent, err := c.send(ctx, to, msg, ct)
 	if err == nil && kind == "audio" && caption != "" {
 		// WhatsApp audio has no caption: send it as a follow-up text.
-		if _, err := c.SendText(ctx, to, caption, ""); err != nil {
+		if _, err := c.SendText(ctx, to, caption, "", nil); err != nil {
 			return sent, fmt.Errorf("audio sent, but its caption failed: %w", err)
 		}
 	}
@@ -341,7 +365,7 @@ func (c *Client) send(ctx context.Context, to types.JID, msg *waE2E.Message, ct 
 	err = c.store.SaveMessage(ctx, store.Message{
 		ChatJID: to.String(), ID: resp.ID, SenderJID: c.OwnJID().String(), FromMe: true,
 		Timestamp: resp.Timestamp, Text: ct.Text, MediaType: ct.MediaType,
-		Filename: ct.Filename, MimeType: ct.MimeType, Raw: ct.Raw,
+		Filename: ct.Filename, MimeType: ct.MimeType, Raw: ct.Raw, QuotedID: ct.QuotedID,
 	})
 	if err != nil {
 		c.log.Warnf("message sent but not archived: %v", err)
@@ -368,7 +392,9 @@ func (c *Client) checkRecipient(ctx context.Context, to types.JID) error {
 	return nil
 }
 
-// Download fetches the media of a stored message into dir and returns the file path.
+// Download fetches the media of a stored message into dir and returns the
+// file path. Media older than a few weeks is gone from WhatsApp's servers: it
+// then asks the phone to upload it again, which needs the phone online.
 func (c *Client) Download(ctx context.Context, chat types.JID, messageID, dir string) (string, store.Message, error) {
 	m, err := c.store.GetMessage(ctx, chat.String(), messageID)
 	if err != nil {
@@ -380,13 +406,16 @@ func (c *Client) Download(ctx context.Context, chat types.JID, messageID, dir st
 	if len(m.Raw) == 0 {
 		return "", m, errors.New("message has no downloadable media")
 	}
-	media, err := downloadable(m.Raw)
+	root, media, err := downloadable(m.Raw)
 	if err != nil {
 		return "", m, err
 	}
 	data, err := c.wm.Download(ctx, media)
+	if expired(err) {
+		data, err = c.redownload(ctx, chat, m, root, media)
+	}
 	if err != nil {
-		return "", m, fmt.Errorf("download (the media may have expired from WhatsApp's servers): %w", err)
+		return "", m, fmt.Errorf("download: %w", err)
 	}
 
 	name := sanitizeFilename(m.Filename)
@@ -403,6 +432,74 @@ func (c *Client) Download(ctx context.Context, chat types.JID, messageID, dir st
 		return "", m, fmt.Errorf("write media: %w", err)
 	}
 	return target, m, nil
+}
+
+func expired(err error) bool {
+	return errors.Is(err, whatsmeow.ErrMediaDownloadFailedWith403) ||
+		errors.Is(err, whatsmeow.ErrMediaDownloadFailedWith404) ||
+		errors.Is(err, whatsmeow.ErrMediaDownloadFailedWith410)
+}
+
+// mediaRetryTimeout bounds the wait for the phone to re-upload expired media.
+var mediaRetryTimeout = 45 * time.Second
+
+// redownload asks the phone to re-upload expired media, then downloads it from
+// its new location and remembers that location.
+func (c *Client) redownload(ctx context.Context, chat types.JID, m store.Message, root *waE2E.Message, media mediaMessage) ([]byte, error) {
+	if !c.Connected() {
+		return nil, errors.New("the media expired from WhatsApp's servers and wamcp is not connected to ask the phone for it again")
+	}
+	sender, _ := types.ParseJID(m.SenderJID)
+	info := &types.MessageInfo{
+		MessageSource: types.MessageSource{Chat: c.peerChat(ctx, chat), Sender: sender, IsFromMe: m.FromMe, IsGroup: chat.Server == types.GroupServer},
+		ID:            m.ID,
+	}
+	ch := make(chan *events.MediaRetry, 1)
+	c.mediaRetries.Store(m.ID, ch)
+	defer c.mediaRetries.Delete(m.ID)
+	if err := c.wm.SendMediaRetryReceipt(ctx, info, media.GetMediaKey()); err != nil {
+		return nil, fmt.Errorf("the media expired and asking the phone to upload it again failed: %w", err)
+	}
+
+	var evt *events.MediaRetry
+	select {
+	case evt = <-ch:
+	case <-time.After(mediaRetryTimeout):
+		return nil, errors.New("the media expired from WhatsApp's servers and the phone did not upload it again (it must be online and still have the file)")
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	if evt.Error != nil {
+		return nil, fmt.Errorf("the phone could not upload the expired media again (code %d): it was probably deleted from the phone", evt.Error.Code)
+	}
+	retry, err := whatsmeow.DecryptMediaRetryNotification(evt, media.GetMediaKey())
+	if err != nil {
+		return nil, fmt.Errorf("decode media re-upload: %w", err)
+	}
+	if retry.GetResult() != waMmsRetry.MediaRetryNotification_SUCCESS || retry.GetDirectPath() == "" {
+		return nil, fmt.Errorf("the phone could not upload the expired media again (%s): it was probably deleted from the phone", retry.GetResult())
+	}
+	setDirectPath(media, retry.GetDirectPath())
+	data, err := c.wm.Download(ctx, media)
+	if err != nil {
+		return nil, err
+	}
+	if raw, err := proto.Marshal(root); err == nil {
+		c.logErr(c.store.UpdateRaw(ctx, chat.String(), m.ID, raw))
+	}
+	return data, nil
+}
+
+// peerChat is the chat JID the phone files a 1:1 conversation under: its LID
+// when known (WhatsApp moved chats to LIDs), else the phone-number JID.
+func (c *Client) peerChat(ctx context.Context, chat types.JID) types.JID {
+	if chat.Server != types.DefaultUserServer {
+		return chat
+	}
+	if lid, err := c.wm.Store.LIDs.GetLIDForPN(ctx, chat); err == nil && !lid.IsEmpty() {
+		return lid
+	}
+	return chat
 }
 
 // FilePolicy restricts which local files send_file may read. Messages the

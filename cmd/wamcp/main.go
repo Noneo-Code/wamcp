@@ -46,6 +46,8 @@ Usage:
   wamcp login  [--phone +33612345678]   Link your WhatsApp account (QR code or pairing code)
   wamcp serve  [--http 127.0.0.1:8765]  Run the MCP server (stdio by default)
                [--send-root DIR]        Only let send_file read files under DIR
+               [--read-only]            Hide the tools that send, react or delete
+               [--allow-chats A,B]      Only give access to these chats (JIDs, numbers or names)
   wamcp status                          Show the linked account and archive size
   wamcp token                           Print the bearer token used by --http
   wamcp logout [--purge]                Unlink the device (and delete the archive with --purge)
@@ -201,6 +203,8 @@ func cmdServe(ctx context.Context, args []string) error {
 	addr := fs.String("http", "", "serve MCP over Streamable HTTP on this address (e.g. 127.0.0.1:8765) instead of stdio")
 	allowRemote := fs.Bool("allow-remote", false, "allow --http on a non-loopback address (put it behind a TLS reverse proxy)")
 	sendRoot := fs.String("send-root", "", "only allow send_file to read files under this directory")
+	readOnly := fs.Bool("read-only", false, "hide every tool that sends, reacts or deletes")
+	allowChats := fs.String("allow-chats", "", "comma-separated chats (JIDs, phone numbers or names) the tools may access; default all")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -219,15 +223,37 @@ func cmdServe(ctx context.Context, args []string) error {
 		}
 	}
 	e.client.SetFilePolicy(policy)
+	opts := mcpserver.Options{ReadOnly: *readOnly}
+	if *allowChats != "" {
+		if opts.AllowedChats, err = resolveChats(ctx, e.client, *allowChats); err != nil {
+			return err
+		}
+	}
 	if err := e.client.Connect(); err != nil {
 		return err
 	}
-	srv := mcpserver.New(e.client, e.paths.MediaDir, version)
+	srv := mcpserver.New(e.client, e.paths.MediaDir, version, opts)
 
 	if *addr == "" {
 		return ignoreCanceled(srv.Run(ctx, &mcp.StdioTransport{}))
 	}
 	return serveHTTP(ctx, srv, *addr, *allowRemote, e)
+}
+
+// resolveChats turns the --allow-chats list into JIDs.
+func resolveChats(ctx context.Context, c *wa.Client, list string) ([]string, error) {
+	jids := []string{}
+	for _, item := range strings.Split(list, ",") {
+		if item = strings.TrimSpace(item); item == "" {
+			continue
+		}
+		jid, err := c.Resolve(ctx, item)
+		if err != nil {
+			return nil, fmt.Errorf("--allow-chats: %w", err)
+		}
+		jids = append(jids, jid.String())
+	}
+	return jids, nil
 }
 
 func serveHTTP(ctx context.Context, srv *mcp.Server, addr string, remote bool, e *env) error {

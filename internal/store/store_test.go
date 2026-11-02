@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"path/filepath"
 	"testing"
@@ -247,5 +248,93 @@ func TestOnlySenderCanOverwriteEditOrDelete(t *testing.T) {
 	}
 	if deleted, _ := s.DeleteMessage(ctx, chat, "id1", "admin@s.whatsapp.net", true); !deleted {
 		t.Fatal("admin delete not applied")
+	}
+}
+
+func TestMigrateFromV010Schema(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "old.db")
+	// The archive layout shipped in v0.1.0, before any migration existed.
+	db, err := sql.Open("sqlite", "file:"+path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(schema); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO chats (jid) VALUES ('c'); INSERT INTO messages (chat_jid, id, ts, text) VALUES ('c', 'old', 1, 'kept')`); err != nil {
+		t.Fatal(err)
+	}
+	_ = db.Close()
+
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	m, err := s.GetMessage(context.Background(), "c", "old")
+	if err != nil || m.Text != "kept" || m.QuotedID != "" {
+		t.Fatalf("old message after migration: %+v, %v", m, err)
+	}
+	_ = s.Close()
+	// Opening again must not re-run the migration.
+	again, err := Open(path)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	_ = again.Close()
+}
+
+func TestReactions(t *testing.T) {
+	s := openTest(t)
+	ctx := context.Background()
+	t0 := time.Unix(1000, 0)
+	must(t, s.SetReaction(ctx, "c", "m1", "alice", "👍", t0))
+	must(t, s.SetReaction(ctx, "c", "m1", "bob", "❤️", t0))
+	must(t, s.SetReaction(ctx, "c", "m1", "alice", "😂", t0.Add(time.Second)))
+	// A replayed older event (history sync) must not win.
+	must(t, s.SetReaction(ctx, "c", "m1", "alice", "👍", t0))
+	must(t, s.SetReaction(ctx, "c", "m1", "bob", "", t0.Add(time.Second)))
+
+	r, err := s.Reactions(ctx, "c", []string{"m1", "m2"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(r["m1"]) != 1 || r["m1"][0].SenderJID != "alice" || r["m1"][0].Emoji != "😂" {
+		t.Errorf("reactions = %+v", r)
+	}
+}
+
+func TestQuotedIDAndOnlyFilter(t *testing.T) {
+	s := openTest(t)
+	ctx := context.Background()
+	must(t, s.SaveMessage(ctx, Message{ChatJID: "a", ID: "1", Timestamp: time.Unix(10, 0), Text: "hello"}))
+	must(t, s.SaveMessage(ctx, Message{ChatJID: "b", ID: "2", Timestamp: time.Unix(20, 0), Text: "hello", QuotedID: "1"}))
+
+	if m, _ := s.GetMessage(ctx, "b", "2"); m.QuotedID != "1" {
+		t.Errorf("quoted id = %q", m.QuotedID)
+	}
+	found, err := s.Search(ctx, SearchParams{Query: "hello", Only: []string{"a"}})
+	if err != nil || len(found) != 1 || found[0].ChatJID != "a" {
+		t.Errorf("search with Only = %+v, %v", found, err)
+	}
+	if found, _ := s.Search(ctx, SearchParams{Query: "hello", Only: []string{}}); len(found) != 0 {
+		t.Errorf("empty allow-list must match nothing, got %d", len(found))
+	}
+	chats, err := s.ListChats(ctx, ListChatsParams{Only: []string{"b"}})
+	if err != nil || len(chats) != 1 || chats[0].JID != "b" {
+		t.Errorf("list chats with Only = %+v, %v", chats, err)
+	}
+	if old, _ := s.OldestMessage(ctx, "b"); old.ID != "2" {
+		t.Errorf("oldest = %+v", old)
+	}
+	if n, _ := s.CountMessages(ctx, "a"); n != 1 {
+		t.Errorf("count = %d", n)
+	}
+}
+
+func must(t *testing.T, err error) {
+	t.Helper()
+	if err != nil {
+		t.Fatal(err)
 	}
 }

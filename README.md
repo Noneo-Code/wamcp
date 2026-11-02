@@ -19,12 +19,13 @@ no bridge process, no Python, no open port by default.
 
 ## Features
 
-- **Read** chats and messages, including the history WhatsApp syncs when you link the device
+- **Read** chats and messages with replies and reactions, including the history WhatsApp syncs when you link the device, and **load older messages** from the phone on demand
 - **Search** messages and file names across every chat
-- **Send** text (with replies) and files: images, videos, audio, documents
-- **Download** received media to disk
+- **Send** text (with replies and @mentions), files (images, videos, documents, voice messages) and reactions; delete your own messages
+- **Download** received media, even after it expired from WhatsApp's servers (the phone uploads it again); images are shown to the model
 - Recipients by **name, phone number or JID**, with explicit errors on ambiguous names
 - Edits and deletions (*"delete for everyone"*) are applied to the archive
+- **Read-only mode** and a **chat allow-list** to limit what the model can reach
 - Pure Go, `CGO_ENABLED=0`: prebuilt binaries for macOS, Linux and Windows (amd64/arm64)
 
 ## Install
@@ -81,18 +82,34 @@ Claude Desktop, Cursor and other clients (`mcpServers` configuration):
 | `get_messages` | Messages of a chat in chronological order, paginated with `before_message_id` |
 | `search_messages` | Substring search in message text and file names (case-insensitive for unaccented letters) |
 | `search_contacts` | Find contacts and groups to get their JID |
-| `download_media` | Save a message's image, video, audio or document to disk |
-| `send_message` | Send a text, optionally as a reply |
-| `send_file` | Send a local file by absolute path (max 100 MB) |
+| `get_group_info` | Subject, description, members and admins of a group |
+| `download_media` | Save a message's image, video, audio or document to disk (images are also shown to the model); expired media is requested again from the phone |
+| `load_older_messages` | Ask the phone for messages older than the oldest archived one (phone must be online) |
+| `send_message` | Send a text, optionally as a reply and with @mentions |
+| `send_file` | Send a local file by absolute path (max 100 MB); an Ogg/Opus file is sent as a voice message |
+| `send_reaction` | React to a message with an emoji, or remove your reaction |
+| `delete_message` | Delete one of your own messages for everyone |
 
-Sending tools are annotated as non read-only, so MCP clients ask for confirmation
-before running them.
+Messages carry `reply_to_message_id` and their `reactions`. Sending tools are annotated
+as non read-only (and `delete_message` as destructive), so MCP clients ask for
+confirmation before running them.
 
 > [!IMPORTANT]
 > **Received messages are untrusted input.** Anyone who can message you can try to
 > instruct the model ("send me the file at …"). Keep confirmations on for the sending
 > tools. `send_file` always refuses the wamcp data directory (your session keys), and
 > `wamcp serve --send-root ~/Documents/to-share` restricts it to one directory.
+
+To reduce what a model can do, combine:
+
+```sh
+wamcp serve --read-only                          # no send, react or delete tool at all
+wamcp serve --allow-chats "+33612345678,Family"  # only these chats are visible and reachable
+```
+
+`--allow-chats` takes JIDs, phone numbers or names (resolved at start-up; an ambiguous
+name is an error). Every message is still archived locally; the restriction applies to
+what the tools return and where they can send.
 
 Wherever a chat is expected you can pass a **JID** (`33612345678@s.whatsapp.net`,
 `1203630…@g.us`), an **international phone number** (`+33 6 12 34 56 78`) or a **name**.
@@ -154,6 +171,8 @@ On Linux, the equivalent is a `systemd --user` service running the same command.
 wamcp login  [--phone +33612345678]   Link your WhatsApp account
 wamcp serve  [--http 127.0.0.1:8765]  Run the MCP server (stdio by default)
              [--send-root DIR]        Only let send_file read files under DIR
+             [--read-only]            Hide the tools that send, react or delete
+             [--allow-chats A,B]      Only give access to these chats
 wamcp status                          Linked account, archive size, whether a server runs
 wamcp token                           Print the bearer token used by --http
 wamcp logout [--purge]                Unlink the device (--purge also deletes the archive)
@@ -177,7 +196,7 @@ Everything stays on your machine, in `$WAMCP_DATA_DIR` or by default
 | `token` | Bearer token for `--http` |
 
 wamcp only knows messages received while it runs, plus the history your phone sends
-at link time. Status updates, channels and broadcast lists are not archived. Your messages are sent to whichever AI model your MCP client uses: check
+at link time; `load_older_messages` asks the phone for more, one chat at a time. Status updates, channels and broadcast lists are not archived. Your messages are sent to whichever AI model your MCP client uses: check
 that this is acceptable for you and for the people you talk to.
 
 To stop: `wamcp logout --purge`, and check *Linked devices* on your phone.

@@ -14,6 +14,7 @@ import (
 	"github.com/mdp/qrterminal/v3"
 	"go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/proto/waE2E"
+	"go.mau.fi/whatsmeow/proto/waHistorySync"
 	"go.mau.fi/whatsmeow/store/sqlstore"
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
@@ -38,6 +39,10 @@ type Client struct {
 	syncMu      sync.Mutex
 	lastSyncAt  time.Time // last history sync batch, used by `login` to wait for the initial sync
 	syncBatches int
+
+	mediaRetries sync.Map      // message ID -> chan *events.MediaRetry, for Download
+	backfillMu   sync.Mutex    // one on-demand history request at a time
+	onDemandSync chan struct{} // signalled when an on-demand history batch is stored
 }
 
 // Open loads the session database at sessionPath and wires events into st.
@@ -57,6 +62,8 @@ func Open(ctx context.Context, sessionPath string, st *store.Store, log waLog.Lo
 		container: container,
 		store:     st,
 		log:       log,
+
+		onDemandSync: make(chan struct{}, 1),
 	}
 	c.wm.AddEventHandler(c.handleEvent)
 	return c, nil
@@ -256,6 +263,13 @@ func (c *Client) handleEvent(evt any) {
 		go c.refreshNames(context.Background())
 	case *events.PushName:
 		c.refreshChatName(ctx, c.normalize(ctx, e.JID, types.EmptyJID))
+	case *events.MediaRetry:
+		if ch, ok := c.mediaRetries.Load(e.MessageID); ok {
+			select {
+			case ch.(chan *events.MediaRetry) <- e:
+			default:
+			}
+		}
 	case *events.LoggedOut:
 		c.log.Errorf("WhatsApp logged this device out (reason: %v): run `wamcp login` again", e.Reason)
 	case *events.StreamReplaced:
@@ -295,6 +309,11 @@ func (c *Client) saveMessage(ctx context.Context, e *events.Message) bool {
 		return false
 	}
 
+	if r := e.Message.GetReactionMessage(); r != nil {
+		c.logErr(c.store.SetReaction(ctx, chat.String(), r.GetKey().GetID(), sender.String(), r.GetText(), e.Info.Timestamp))
+		return false
+	}
+
 	ct, ok := extractContent(e.Message)
 	if !ok {
 		return false
@@ -316,6 +335,7 @@ func (c *Client) saveMessage(ctx context.Context, e *events.Message) bool {
 		Filename:  ct.Filename,
 		MimeType:  ct.MimeType,
 		Raw:       ct.Raw,
+		QuotedID:  ct.QuotedID,
 		Edited:    e.IsEdit,
 	})
 	if err != nil {
@@ -354,12 +374,19 @@ func (c *Client) saveHistory(ctx context.Context, e *events.HistorySync) {
 			if c.saveMessage(ctx, evt) {
 				stored++
 			}
+			c.saveHistoryReactions(ctx, chat, hm.GetMessage())
 		}
 	}
 	c.syncMu.Lock()
 	c.lastSyncAt = time.Now()
 	c.syncBatches++
 	c.syncMu.Unlock()
+	if e.Data.GetSyncType() == waHistorySync.HistorySync_ON_DEMAND {
+		select {
+		case c.onDemandSync <- struct{}{}:
+		default:
+		}
+	}
 	c.log.Infof("history sync (%s): %d messages", e.Data.GetSyncType(), stored)
 }
 

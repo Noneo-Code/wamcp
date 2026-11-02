@@ -40,8 +40,16 @@ type Message struct {
 	Filename  string
 	MimeType  string
 	Raw       []byte // serialized waE2E.Message, kept only for media (needed to download it)
+	QuotedID  string // id of the message this one replies to
 	Edited    bool
 	Deleted   bool
+}
+
+// Reaction is an emoji reaction to a message.
+type Reaction struct {
+	SenderJID string
+	Emoji     string
+	Timestamp time.Time
 }
 
 // Store wraps the SQLite database.
@@ -75,6 +83,21 @@ CREATE INDEX IF NOT EXISTS messages_chat_ts ON messages(chat_jid, ts);
 CREATE INDEX IF NOT EXISTS messages_ts ON messages(ts);
 `
 
+// migrations upgrade an existing archive; migrations[i] moves it from
+// user_version i to i+1. Never edit a released migration, append a new one.
+var migrations = []string{
+	// v0.2.0: reply tracking and reactions.
+	`ALTER TABLE messages ADD COLUMN quoted_id TEXT NOT NULL DEFAULT '';
+	CREATE TABLE reactions (
+		chat_jid   TEXT NOT NULL,
+		message_id TEXT NOT NULL,
+		sender_jid TEXT NOT NULL,
+		emoji      TEXT NOT NULL,
+		ts         INTEGER NOT NULL,
+		PRIMARY KEY (chat_jid, message_id, sender_jid)
+	);`,
+}
+
 // Open opens (and creates if needed) the archive at path.
 func Open(path string) (*Store, error) {
 	dsn := "file:" + path + "?_pragma=foreign_keys(1)&_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=synchronous(NORMAL)"
@@ -89,7 +112,39 @@ func Open(path string) (*Store, error) {
 		_ = db.Close()
 		return nil, fmt.Errorf("initialise message store: %w", err)
 	}
+	if err := migrate(db); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
 	return &Store{db: db}, nil
+}
+
+func migrate(db *sql.DB) error {
+	var version int
+	if err := db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil {
+		return fmt.Errorf("read archive version: %w", err)
+	}
+	if version > len(migrations) {
+		return fmt.Errorf("the message archive was created by a newer wamcp (schema %d, this one knows %d): upgrade wamcp", version, len(migrations))
+	}
+	for i := version; i < len(migrations); i++ {
+		tx, err := db.Begin()
+		if err != nil {
+			return fmt.Errorf("migrate archive: %w", err)
+		}
+		if _, err := tx.Exec(migrations[i]); err != nil {
+			_ = tx.Rollback()
+			return fmt.Errorf("migrate archive to schema %d: %w", i+1, err)
+		}
+		if _, err := tx.Exec(fmt.Sprintf(`PRAGMA user_version = %d`, i+1)); err != nil {
+			_ = tx.Rollback()
+			return fmt.Errorf("migrate archive to schema %d: %w", i+1, err)
+		}
+		if err := tx.Commit(); err != nil {
+			return fmt.Errorf("migrate archive to schema %d: %w", i+1, err)
+		}
+	}
+	return nil
 }
 
 // Close closes the database.
@@ -140,8 +195,8 @@ func (s *Store) SaveMessage(ctx context.Context, m Message) error {
 		return fmt.Errorf("bump chat %s: %w", m.ChatJID, err)
 	}
 	if _, err := tx.ExecContext(ctx, `
-		INSERT INTO messages (chat_jid, id, sender_jid, from_me, ts, text, media_type, filename, mimetype, raw, edited, deleted)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		INSERT INTO messages (chat_jid, id, sender_jid, from_me, ts, text, media_type, filename, mimetype, raw, quoted_id, edited, deleted)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(chat_jid, id) DO UPDATE SET
 			sender_jid = excluded.sender_jid,
 			from_me = excluded.from_me,
@@ -151,13 +206,14 @@ func (s *Store) SaveMessage(ctx context.Context, m Message) error {
 			filename = excluded.filename,
 			mimetype = excluded.mimetype,
 			raw = CASE WHEN messages.deleted = 1 THEN NULL ELSE COALESCE(excluded.raw, messages.raw) END,
+			quoted_id = CASE WHEN excluded.quoted_id <> '' THEN excluded.quoted_id ELSE messages.quoted_id END,
 			edited = MAX(messages.edited, excluded.edited),
 			deleted = MAX(messages.deleted, excluded.deleted)
 		-- Message IDs are chosen by the sending client: only the original sender
 		-- may refresh a message, so nobody can overwrite someone else's by reusing its ID.
 		WHERE messages.sender_jid = excluded.sender_jid AND messages.from_me = excluded.from_me`,
 		m.ChatJID, m.ID, m.SenderJID, m.FromMe, unix(m.Timestamp), m.Text,
-		m.MediaType, m.Filename, m.MimeType, nilIfEmpty(m.Raw), m.Edited, m.Deleted); err != nil {
+		m.MediaType, m.Filename, m.MimeType, nilIfEmpty(m.Raw), m.QuotedID, m.Edited, m.Deleted); err != nil {
 		return fmt.Errorf("save message %s: %w", m.ID, err)
 	}
 	return tx.Commit()
@@ -193,6 +249,90 @@ func (s *Store) DeleteMessage(ctx context.Context, chatJID, id, revokerJID strin
 	return n > 0, err
 }
 
+// UpdateRaw replaces the stored payload of a media message (e.g. with a
+// refreshed download path after WhatsApp re-uploaded it).
+func (s *Store) UpdateRaw(ctx context.Context, chatJID, id string, raw []byte) error {
+	_, err := s.db.ExecContext(ctx, `UPDATE messages SET raw = ? WHERE chat_jid = ? AND id = ? AND deleted = 0`, raw, chatJID, id)
+	if err != nil {
+		return fmt.Errorf("update message %s: %w", id, err)
+	}
+	return nil
+}
+
+// SetReaction records sender's reaction to a message; an empty emoji removes
+// it. An older event (e.g. replayed by a history sync) never overrides a newer one.
+func (s *Store) SetReaction(ctx context.Context, chatJID, messageID, senderJID, emoji string, at time.Time) error {
+	var err error
+	if emoji == "" {
+		_, err = s.db.ExecContext(ctx, `DELETE FROM reactions WHERE chat_jid = ? AND message_id = ? AND sender_jid = ? AND ts <= ?`,
+			chatJID, messageID, senderJID, unix(at))
+	} else {
+		_, err = s.db.ExecContext(ctx, `
+			INSERT INTO reactions (chat_jid, message_id, sender_jid, emoji, ts) VALUES (?, ?, ?, ?, ?)
+			ON CONFLICT(chat_jid, message_id, sender_jid) DO UPDATE SET emoji = excluded.emoji, ts = excluded.ts
+			WHERE excluded.ts >= reactions.ts`,
+			chatJID, messageID, senderJID, emoji, unix(at))
+	}
+	if err != nil {
+		return fmt.Errorf("save reaction to %s: %w", messageID, err)
+	}
+	return nil
+}
+
+// Reactions returns the reactions to the given messages of a chat, by message id.
+func (s *Store) Reactions(ctx context.Context, chatJID string, ids []string) (map[string][]Reaction, error) {
+	out := map[string][]Reaction{}
+	if len(ids) == 0 {
+		return out, nil
+	}
+	args := []any{chatJID}
+	for _, id := range ids {
+		args = append(args, id)
+	}
+	// Only "?" placeholders are concatenated; values go through args.
+	q := `SELECT message_id, sender_jid, emoji, ts FROM reactions WHERE chat_jid = ? AND message_id IN (` + //nolint:gosec
+		placeholders(len(ids)) + `) ORDER BY ts`
+	rows, err := s.db.QueryContext(ctx, q, args...)
+	if err != nil {
+		return nil, fmt.Errorf("list reactions: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var (
+			id string
+			r  Reaction
+			ts int64
+		)
+		if err := rows.Scan(&id, &r.SenderJID, &r.Emoji, &ts); err != nil {
+			return nil, fmt.Errorf("scan reaction: %w", err)
+		}
+		r.Timestamp = fromUnix(ts)
+		out[id] = append(out[id], r)
+	}
+	return out, rows.Err()
+}
+
+// OldestMessage returns the oldest stored message of a chat.
+func (s *Store) OldestMessage(ctx context.Context, chatJID string) (Message, error) {
+	msgs, err := s.queryMessages(ctx, `WHERE chat_jid = ? ORDER BY ts, rowid LIMIT 1`, chatJID)
+	if err != nil {
+		return Message{}, err
+	}
+	if len(msgs) == 0 {
+		return Message{}, ErrNotFound
+	}
+	return msgs[0], nil
+}
+
+// CountMessages returns the number of stored messages in a chat.
+func (s *Store) CountMessages(ctx context.Context, chatJID string) (int, error) {
+	var n int
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM messages WHERE chat_jid = ?`, chatJID).Scan(&n); err != nil {
+		return 0, fmt.Errorf("count messages: %w", err)
+	}
+	return n, nil
+}
+
 // MessageSender returns the sender of a stored message.
 func (s *Store) MessageSender(ctx context.Context, chatJID, id string) (string, error) {
 	var sender string
@@ -208,7 +348,8 @@ func (s *Store) MessageSender(ctx context.Context, chatJID, id string) (string, 
 
 // ListChatsParams filters ListChats.
 type ListChatsParams struct {
-	Query  string // case-insensitive match on name or JID; empty matches all
+	Query  string   // case-insensitive match on name or JID; empty matches all
+	Only   []string // if set, only these chat JIDs
 	Limit  int
 	Offset int
 }
@@ -221,11 +362,23 @@ func (s *Store) ListChats(ctx context.Context, p ListChatsParams) ([]Chat, error
 		FROM chats c
 		LEFT JOIN messages m ON m.rowid = (
 			SELECT rowid FROM messages WHERE chat_jid = c.jid ORDER BY ts DESC LIMIT 1)`
-	var args []any
+	var (
+		args  []any
+		conds []string
+	)
 	if p.Query != "" {
-		q += ` WHERE c.name LIKE ? ESCAPE '\' OR c.jid LIKE ? ESCAPE '\'`
+		conds = append(conds, `(c.name LIKE ? ESCAPE '\' OR c.jid LIKE ? ESCAPE '\')`)
 		pattern := likePattern(p.Query)
 		args = append(args, pattern, pattern)
+	}
+	if p.Only != nil {
+		conds = append(conds, `c.jid IN (`+placeholders(len(p.Only))+`)`)
+		for _, j := range p.Only {
+			args = append(args, j)
+		}
+	}
+	if len(conds) > 0 {
+		q += ` WHERE ` + strings.Join(conds, " AND ") //nolint:gosec // constant clauses with "?" placeholders
 	}
 	q += ` ORDER BY c.last_message_at DESC LIMIT ? OFFSET ?`
 	args = append(args, limit(p.Limit, 20, 200), max(p.Offset, 0))
@@ -337,8 +490,9 @@ func (s *Store) Messages(ctx context.Context, p MessagesParams) ([]Message, erro
 
 // SearchParams filters Search.
 type SearchParams struct {
-	Query   string // substring of the text or filename (case-insensitive for ASCII letters)
-	ChatJID string // optional
+	Query   string   // substring of the text or filename (case-insensitive for ASCII letters)
+	ChatJID string   // optional
+	Only    []string // if set, only messages of these chats
 	Limit   int
 }
 
@@ -353,6 +507,12 @@ func (s *Store) Search(ctx context.Context, p SearchParams) ([]Message, error) {
 	if p.ChatJID != "" {
 		where += ` AND chat_jid = ?`
 		args = append(args, p.ChatJID)
+	}
+	if p.Only != nil {
+		where += ` AND chat_jid IN (` + placeholders(len(p.Only)) + `)`
+		for _, j := range p.Only {
+			args = append(args, j)
+		}
 	}
 	args = append(args, limit(p.Limit, 30, 200))
 	return s.queryMessages(ctx, where+` ORDER BY ts DESC LIMIT ?`, args...)
@@ -381,7 +541,7 @@ func (s *Store) Stats(ctx context.Context) (chats, messages int, err error) {
 }
 
 func (s *Store) queryMessages(ctx context.Context, tail string, args ...any) ([]Message, error) {
-	const selectMessages = `SELECT chat_jid, id, sender_jid, from_me, ts, text, media_type, filename, mimetype, raw, edited, deleted FROM messages `
+	const selectMessages = `SELECT chat_jid, id, sender_jid, from_me, ts, text, media_type, filename, mimetype, raw, quoted_id, edited, deleted FROM messages `
 	// tail is always one of this file's constant clauses; values go through args.
 	rows, err := s.db.QueryContext(ctx, selectMessages+tail, args...) //nolint:gosec // see above
 	if err != nil {
@@ -395,13 +555,22 @@ func (s *Store) queryMessages(ctx context.Context, tail string, args ...any) ([]
 			ts int64
 		)
 		if err := rows.Scan(&m.ChatJID, &m.ID, &m.SenderJID, &m.FromMe, &ts, &m.Text,
-			&m.MediaType, &m.Filename, &m.MimeType, &m.Raw, &m.Edited, &m.Deleted); err != nil {
+			&m.MediaType, &m.Filename, &m.MimeType, &m.Raw, &m.QuotedID, &m.Edited, &m.Deleted); err != nil {
 			return nil, fmt.Errorf("scan message: %w", err)
 		}
 		m.Timestamp = fromUnix(ts)
 		msgs = append(msgs, m)
 	}
 	return msgs, rows.Err()
+}
+
+// placeholders returns "?, ?, …" for n values; an empty list yields NULL so
+// that "IN (NULL)" matches nothing.
+func placeholders(n int) string {
+	if n == 0 {
+		return "NULL"
+	}
+	return strings.TrimSuffix(strings.Repeat("?, ", n), ", ")
 }
 
 func likePattern(s string) string {

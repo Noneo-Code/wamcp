@@ -1,6 +1,7 @@
 package wa
 
 import (
+	"encoding/binary"
 	"testing"
 
 	"go.mau.fi/whatsmeow/proto/waE2E"
@@ -46,15 +47,21 @@ func TestDownloadableRoundTrip(t *testing.T) {
 		Message: &waE2E.Message{DocumentMessage: &waE2E.DocumentMessage{DirectPath: proto.String("/v/x"), Mimetype: proto.String("application/pdf")}},
 	}}
 	ct, _ := extractContent(msg)
-	m, err := downloadable(ct.Raw)
+	root, m, err := downloadable(ct.Raw)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if m.GetDirectPath() != "/v/x" || m.GetMimetype() != "application/pdf" {
 		t.Errorf("got %v %v", m.GetDirectPath(), m.GetMimetype())
 	}
-	raw, _ := proto.Marshal(&waE2E.Message{Conversation: proto.String("x")})
-	if _, err := downloadable(raw); err == nil {
+	// A refreshed path must survive re-encoding the whole message.
+	setDirectPath(m, "/v/new")
+	raw, _ := proto.Marshal(root)
+	if _, m2, _ := downloadable(raw); m2.GetDirectPath() != "/v/new" {
+		t.Errorf("path after re-encode = %q", m2.GetDirectPath())
+	}
+	raw, _ = proto.Marshal(&waE2E.Message{Conversation: proto.String("x")})
+	if _, _, err := downloadable(raw); err == nil {
 		t.Error("expected error for text message")
 	}
 }
@@ -105,11 +112,46 @@ func TestExtractContentExtraTypes(t *testing.T) {
 	ptv := &waE2E.Message{PtvMessage: &waE2E.VideoMessage{Mimetype: proto.String("video/mp4")}}
 	if c, ok := extractContent(ptv); !ok || c.MediaType != "video" || len(c.Raw) == 0 {
 		t.Errorf("video note: %+v", c)
-	} else if _, err := downloadable(c.Raw); err != nil {
+	} else if _, _, err := downloadable(c.Raw); err != nil {
 		t.Errorf("video note should be downloadable: %v", err)
 	}
 	inv := &waE2E.Message{GroupInviteMessage: &waE2E.GroupInviteMessage{GroupName: proto.String("Famille")}}
 	if c, ok := extractContent(inv); !ok || c.Text != "[group invite] Famille" {
 		t.Errorf("group invite: %+v", c)
+	}
+}
+
+func TestQuotedID(t *testing.T) {
+	reply := &waE2E.Message{ExtendedTextMessage: &waE2E.ExtendedTextMessage{
+		Text: proto.String("yes"), ContextInfo: &waE2E.ContextInfo{StanzaID: proto.String("ORIG")},
+	}}
+	if c, _ := extractContent(reply); c.QuotedID != "ORIG" {
+		t.Errorf("text reply quoted id = %q", c.QuotedID)
+	}
+	img := &waE2E.Message{ImageMessage: &waE2E.ImageMessage{ContextInfo: &waE2E.ContextInfo{StanzaID: proto.String("IMG")}}}
+	if c, _ := extractContent(img); c.QuotedID != "IMG" {
+		t.Errorf("image reply quoted id = %q", c.QuotedID)
+	}
+	if c, _ := extractContent(&waE2E.Message{Conversation: proto.String("hi")}); c.QuotedID != "" {
+		t.Errorf("plain text has quoted id %q", c.QuotedID)
+	}
+}
+
+func TestOpusDuration(t *testing.T) {
+	page := func(granule uint64, payload string) []byte {
+		b := make([]byte, 27)
+		copy(b, "OggS")
+		binary.LittleEndian.PutUint64(b[6:14], granule)
+		return append(b, payload...)
+	}
+	ogg := append(page(0, "OpusHead"), page(48000*7+100, "audio")...)
+	if s, ok := opusDuration(ogg); !ok || s != 8 {
+		t.Errorf("duration = %d, %v; want 8 (rounded up)", s, ok)
+	}
+	if _, ok := opusDuration(append(page(0, "vorbis"), page(1, "x")...)); ok {
+		t.Error("Ogg/Vorbis must not be taken for Opus")
+	}
+	if _, ok := opusDuration([]byte("ID3 mp3 data")); ok {
+		t.Error("mp3 must not be taken for Opus")
 	}
 }
