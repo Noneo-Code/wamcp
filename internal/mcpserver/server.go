@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -452,7 +453,7 @@ type sendMessageIn struct {
 	To        string   `json:"to" jsonschema:"recipient: JID, international phone number (+33612345678) or exact contact/group name"`
 	Text      string   `json:"text" jsonschema:"message text"`
 	ReplyToID string   `json:"reply_to_message_id,omitempty" jsonschema:"id of a message in the same chat to reply to"`
-	Mentions  []string `json:"mentions,omitempty" jsonschema:"people to mention in a group (phone numbers or JIDs); the text must contain @<number without +> for each, e.g. @33612345678"`
+	Mentions  []string `json:"mentions,omitempty" jsonschema:"people to mention in a group, as phone numbers or JIDs (not names; use search_contacts first); the text must contain @<number without +> for each, e.g. @33612345678"`
 }
 
 // SentOut confirms a sent message.
@@ -470,6 +471,13 @@ func (s *Server) sendMessage(ctx context.Context, _ *mcp.CallToolRequest, in sen
 	}
 	var mentions []types.JID
 	for _, m := range in.Mentions {
+		// Phone numbers and JIDs only: a name lookup would search the whole
+		// address book and could reveal contacts outside --allow-chats.
+		if !strings.Contains(m, "@") {
+			if _, err := wa.ParsePhone(m); err != nil {
+				return nil, SentOut{}, fmt.Errorf("mention %q: give a phone number in international format or a JID, not a name", m)
+			}
+		}
 		u, err := s.wa.Resolve(ctx, m)
 		if err != nil {
 			return nil, SentOut{}, fmt.Errorf("mention %q: %w", m, err)
