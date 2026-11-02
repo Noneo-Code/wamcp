@@ -28,50 +28,86 @@ no bridge process, no Python, no open port by default.
 - **Read-only mode** and a **chat allow-list** to limit what the model can reach
 - Pure Go, `CGO_ENABLED=0`: prebuilt binaries for macOS, Linux and Windows (amd64/arm64)
 
-## Install
-
-Download a binary from the [releases page](https://github.com/Noneo-Code/wamcp/releases), or with Go 1.26+:
-
-```sh
-go install github.com/Noneo-Code/wamcp/cmd/wamcp@latest
-```
-
 ## Quick start
 
-**1. Link your account.** A QR code is printed in the terminal; scan it from
+**1. Install.** On macOS or Linux, this downloads the latest release into `~/.local/bin`:
+
+```sh
+OS=$(uname -s | tr '[:upper:]' '[:lower:]')
+ARCH=$(uname -m | sed -e 's/x86_64/amd64/' -e 's/aarch64/arm64/')
+mkdir -p ~/.local/bin
+curl -fsSL "https://github.com/Noneo-Code/wamcp/releases/latest/download/wamcp_${OS}_${ARCH}.tar.gz" \
+  | tar -xz -C ~/.local/bin wamcp
+~/.local/bin/wamcp version
+```
+
+<details>
+<summary>Windows (PowerShell)</summary>
+
+```powershell
+$dir = "$env:LOCALAPPDATA\wamcp"
+Invoke-WebRequest https://github.com/Noneo-Code/wamcp/releases/latest/download/wamcp_windows_amd64.zip -OutFile "$env:TEMP\wamcp.zip"
+Expand-Archive "$env:TEMP\wamcp.zip" -DestinationPath $dir -Force
+& "$dir\wamcp.exe" version
+```
+
+Use `wamcp_windows_arm64.zip` on ARM. In the next steps, replace `~/.local/bin/wamcp` with `$dir\wamcp.exe`.
+</details>
+
+<details>
+<summary>Other ways: Go, or a manual download</summary>
+
+With Go 1.26+: `go install github.com/Noneo-Code/wamcp/cmd/wamcp@latest` (installs to `~/go/bin`).
+
+Or download the archive for your system from the [releases page](https://github.com/Noneo-Code/wamcp/releases)
+and check it against `checksums.txt`. On macOS, a binary downloaded with a browser is
+quarantined: run `xattr -d com.apple.quarantine wamcp` once.
+</details>
+
+**2. Link your account.** A QR code is printed in the terminal; scan it from
 WhatsApp › *Linked devices* › *Link a device*.
 
 ```sh
-wamcp login
-# or, without a camera: wamcp login --phone +33612345678  (then type the code in WhatsApp)
+~/.local/bin/wamcp login
+# or, without a camera: ~/.local/bin/wamcp login --phone +33612345678  (then type the code in WhatsApp)
 ```
 
 Keep WhatsApp open on your phone for a minute: it sends your recent history, which
 wamcp archives locally.
 
-**2. Add the server to your MCP client.**
-
-Claude Code:
+**3. Add the server to Claude Code.** Register it with its absolute path, so it works
+whatever your `PATH` is when Claude starts it:
 
 ```sh
-claude mcp add whatsapp -s user -- wamcp serve
+claude mcp add whatsapp --scope user -- ~/.local/bin/wamcp serve
+claude mcp list   # whatsapp: ... ✓ Connected
 ```
 
-Claude Desktop, Cursor and other clients (`mcpServers` configuration):
+Then restart Claude Code (or run `/mcp`). `--scope user` makes it available in every
+project; add `--read-only` after `serve` if you only want to read (see [Security](#security)).
+
+<details>
+<summary>Claude Desktop, Cursor and other MCP clients</summary>
+
+Add this to the client's `mcpServers` configuration, with the absolute path of the binary
+(`echo ~/.local/bin/wamcp` prints it):
 
 ```json
 {
   "mcpServers": {
     "whatsapp": {
-      "command": "wamcp",
+      "command": "/Users/you/.local/bin/wamcp",
       "args": ["serve"]
     }
   }
 }
 ```
+</details>
 
-**3. Ask.** *"What did Sylvain write to me last week?"*, *"Find the invoice PDF Lucile sent"*,
+**4. Ask.** *"What did Sylvain write to me last week?"*, *"Find the invoice PDF Lucile sent"*,
 *"Reply to the team group that I'll be 10 minutes late"*.
+
+To update later, run the install command again; your account and archive are kept.
 
 ## Tools
 
@@ -94,6 +130,12 @@ Messages carry `reply_to_message_id` and their `reactions`. Sending tools are an
 as non read-only (and `delete_message` as destructive), so MCP clients ask for
 confirmation before running them.
 
+Wherever a chat is expected you can pass a **JID** (`33612345678@s.whatsapp.net`,
+`1203630…@g.us`), an **international phone number** (`+33 6 12 34 56 78`) or a **name**.
+A name that matches several chats returns the candidates instead of guessing.
+
+## Security
+
 > [!IMPORTANT]
 > **Received messages are untrusted input.** Anyone who can message you can try to
 > instruct the model ("send me the file at …"). Keep confirmations on for the sending
@@ -110,10 +152,6 @@ wamcp serve --allow-chats "+33612345678,Family"  # only these chats are visible 
 `--allow-chats` takes JIDs, phone numbers or names (resolved at start-up; an ambiguous
 name is an error). Every message is still archived locally; the restriction applies to
 what the tools return and where they can send.
-
-Wherever a chat is expected you can pass a **JID** (`33612345678@s.whatsapp.net`,
-`1203630…@g.us`), an **international phone number** (`+33 6 12 34 56 78`) or a **name**.
-A name that matches several chats returns the candidates instead of guessing.
 
 ## Several MCP clients at once
 

@@ -13,7 +13,9 @@ builds:
       - -s -w -X main.version={{ .Version }}
 
 archives:
-  - formats: [tar.gz]
+  # No version in the name: releases/latest/download/<name> always works (see README).
+  - name_template: "{{ .ProjectName }}_{{ .Os }}_{{ .Arch }}"
+    formats: [tar.gz]
     format_overrides:
       - goos: windows
         formats: [zip]

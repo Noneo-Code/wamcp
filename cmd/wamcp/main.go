@@ -194,7 +194,11 @@ func cmdLogin(ctx context.Context, args []string) error {
 		return err
 	}
 	fmt.Printf("Done: %d history batches, %d chats and %d messages archived in %s\n", batches, st.Chats, st.Messages, e.paths.Dir)
-	fmt.Println("Next: add the server to your MCP client, e.g.  claude mcp add whatsapp -s user -- wamcp serve")
+	bin := "wamcp"
+	if exe, err := os.Executable(); err == nil {
+		bin = exe
+	}
+	fmt.Printf("Next, add the server to Claude Code:\n  claude mcp add whatsapp --scope user -- %q serve\n", bin)
 	return nil
 }
 
