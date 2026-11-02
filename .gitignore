@@ -1,0 +1,13 @@
+# Build output
+/wamcp
+/dist/
+
+# Never commit WhatsApp state (session keys, messages, media, token)
+*.db
+*.db-wal
+*.db-shm
+/media/
+token
+
+.DS_Store
+coverage.out
